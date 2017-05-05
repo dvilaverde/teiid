@@ -85,6 +85,7 @@ public final class RuleChooseDependent implements OptimizerRule {
 	public static final int UNKNOWN_INDEPENDENT_CARDINALITY = BufferManager.DEFAULT_PROCESSOR_BATCH_SIZE;
 	
 	private boolean fullPushOnly;
+	private boolean traditionalOnly;
 	
 	public RuleChooseDependent() {
 	}
@@ -97,13 +98,28 @@ public final class RuleChooseDependent implements OptimizerRule {
         throws QueryPlannerException, QueryMetadataException, TeiidComponentException {
         
         // Find first criteria node in plan with conjuncts        
-        List<CandidateJoin> matches = findCandidate(plan, metadata, analysisRecord);
+        List<CandidateJoin> matches = null;
+        
+        if (fullPushOnly) {
+            //full push requires bottom up processing, 
+            matches = findCandidate(plan, metadata, analysisRecord);
+            Collections.reverse(matches);
+        } else {
+            if (!traditionalOnly) {
+                plan = new RuleChooseDependent(true).execute(plan, metadata, capFinder, rules, analysisRecord, context);
+            }
+            matches = findCandidate(plan, metadata, analysisRecord);
+        }
         
         boolean pushCriteria = false;
 
         // Handle all cases where both siblings are possible matches
         for (CandidateJoin entry : matches) {
             PlanNode joinNode = entry.joinNode;
+            
+            if (fullPushOnly && NodeEditor.findParent(joinNode, NodeConstants.Types.ACCESS) != null) {
+                continue; //already consumed by full pushdown
+            }
             
             PlanNode sourceNode = entry.leftCandidate?joinNode.getFirstChild():joinNode.getLastChild();
             
@@ -116,10 +132,6 @@ public final class RuleChooseDependent implements OptimizerRule {
                 pushCriteria |= markDependent(chosenNode, joinNode, metadata, null, false, capFinder, context, rules, analysisRecord);
                 continue;
             }   
-            
-            if (fullPushOnly) {
-            	continue; //currently has to be hint based
-            }
             
             DependentCostAnalysis dca = NewCalculateCostUtil.computeCostForDepJoin(joinNode, !entry.leftCandidate, metadata, capFinder, context);
             PlanNode dependentNode = sourceNode;
@@ -151,9 +163,9 @@ public final class RuleChooseDependent implements OptimizerRule {
                 }
 
                 if (bothCandidates && sourceNdv != NewCalculateCostUtil.UNKNOWN_VALUE && ((sourceNdv <= RuleChooseDependent.DEFAULT_INDEPENDENT_CARDINALITY 
-                		&& sourceNdv < siblingNdv) || (siblingCost == NewCalculateCostUtil.UNKNOWN_VALUE && sourceNdv <= UNKNOWN_INDEPENDENT_CARDINALITY))) {
+                        && sourceNdv < siblingNdv && sourceCost < 4*siblingCost) || (siblingCost == NewCalculateCostUtil.UNKNOWN_VALUE && sourceNdv <= UNKNOWN_INDEPENDENT_CARDINALITY))) {
                     pushCriteria |= markDependent(siblingNode, joinNode, metadata, null, sourceCost > RuleChooseDependent.DEFAULT_INDEPENDENT_CARDINALITY?true:null, capFinder, context, rules, analysisRecord);
-                } else if (siblingNdv != NewCalculateCostUtil.UNKNOWN_VALUE && ((siblingNdv <= RuleChooseDependent.DEFAULT_INDEPENDENT_CARDINALITY && siblingNdv < sourceNdv) || (sourceCost == NewCalculateCostUtil.UNKNOWN_VALUE && siblingNdv <= UNKNOWN_INDEPENDENT_CARDINALITY))) {
+                } else if (siblingNdv != NewCalculateCostUtil.UNKNOWN_VALUE && ((siblingNdv <= RuleChooseDependent.DEFAULT_INDEPENDENT_CARDINALITY && siblingNdv < sourceNdv && siblingCost < 4*sourceCost) || (sourceCost == NewCalculateCostUtil.UNKNOWN_VALUE && siblingNdv <= UNKNOWN_INDEPENDENT_CARDINALITY))) {
                     pushCriteria |= markDependent(sourceNode, joinNode, metadata, null, siblingCost > RuleChooseDependent.DEFAULT_INDEPENDENT_CARDINALITY?true:null, capFinder, context, rules, analysisRecord);
                 }
             }
@@ -354,7 +366,8 @@ public final class RuleChooseDependent implements OptimizerRule {
         	}
         }
         MakeDep makeDep = (MakeDep)sourceNode.getProperty(Info.MAKE_DEP);
-    	if (fullyPush(sourceNode, joinNode, metadata, capabilitiesFinder, context, indNode, rules, makeDep, analysisRecord, independentExpressions) || fullPushOnly) {
+    	if (fullPushOnly) {
+    	    fullyPush(sourceNode, joinNode, metadata, capabilitiesFinder, context, indNode, rules, makeDep, analysisRecord, independentExpressions);
     		return false;
     	}
 
@@ -580,6 +593,9 @@ public final class RuleChooseDependent implements OptimizerRule {
 		project.addFirstChild(indNode);
 		//run the remaining rules against the subplan
 		RuleStack ruleCopy = rules.clone();
+		RuleChooseDependent ruleChooseDependent = new RuleChooseDependent();
+		ruleChooseDependent.traditionalOnly = true;
+	    ruleCopy.push(ruleChooseDependent);
 		
 		if (indNode.getType() == NodeConstants.Types.ACCESS) {
 			PlanNode root = RuleRaiseAccess.raiseAccessNode(project, indNode, metadata, capabilitiesFinder, true, null, context);
